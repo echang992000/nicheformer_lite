@@ -1,0 +1,44 @@
+{
+  "size": {
+    "teacher_params": 47143314,
+    "student_params": 13073810,
+    "teacher_memory_mb": 188.57,
+    "student_memory_mb": 52.3,
+    "compression_ratio": 3.61
+  },
+  "speed": {
+    "teacher_latency_ms": {
+      "bs1_seq256": 20.78,
+      "bs1_seq512": 38.93,
+      "bs8_seq256": 104.63,
+      "bs8_seq512": 261.18,
+      "bs32_seq256": 389.39,
+      "bs32_seq512": 995.21
+    },
+    "student_latency_ms": {
+      "bs1_seq256": 5.59,
+      "bs1_seq512": 10.08,
+      "bs8_seq256": 25.15,
+      "bs8_seq512": 58.13,
+      "bs32_seq256": 91.23,
+      "bs32_seq512": 214.88
+    },
+    "speedup": {
+      "bs1_seq256": 3.72,
+      "bs1_seq512": 3.86,
+      "bs8_seq256": 4.16,
+      "bs8_seq512": 4.49,
+      "bs32_seq256": 4.27,
+      "bs32_seq512": 4.63
+    }
+  },
+  "quality": {
+    "teacher_mlm_accuracy": 0.0,
+    "student_mlm_accuracy": 0.0,
+    "teacher_top5_recall": 0.0002,
+    "student_top5_recall": 0.0005,
+    "teacher_perplexity": 25025.11,
+    "student_perplexity": 20727.34,
+    "cka_similarity": 0.8478
+  }
+}
