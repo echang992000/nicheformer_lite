@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -171,7 +171,7 @@ class NicheformerTeacher(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         """
         Parameters
         ----------
@@ -183,7 +183,7 @@ class NicheformerTeacher(nn.Module):
         Returns
         -------
         dict with keys:
-            ``mlm_logits``       (batch, seq_len, n_tokens)
+            ``mlm_logits``       (batch, seq_len, vocab_size)
             ``last_hidden``      (batch, seq_len, dim_model)
             ``hidden_states``    list of (batch, seq_len, dim_model)  [optional]
             ``attentions``       list of (batch, nheads, seq_len, seq_len) [optional]
@@ -219,7 +219,7 @@ class NicheformerTeacher(nn.Module):
         # --- heads ---
         mlm_logits = self.classifier(x)
 
-        out: Dict[str, object] = {
+        out: Dict[str, Any] = {
             "mlm_logits": mlm_logits,
             "last_hidden": x,
         }

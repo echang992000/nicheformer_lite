@@ -13,7 +13,7 @@ tokens, yielding an additional large reduction in embedding-table size.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -107,7 +107,7 @@ class NicheformerStudent(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
-    ) -> Dict[str, object]:
+    ) -> Dict[str, Any]:
         """Same signature / return schema as :class:`NicheformerTeacher`."""
         B, S = input_ids.shape
 
@@ -137,7 +137,7 @@ class NicheformerStudent(nn.Module):
 
         mlm_logits = self.classifier(x)
 
-        out: Dict[str, object] = {
+        out: Dict[str, Any] = {
             "mlm_logits": mlm_logits,
             "last_hidden": x,
         }

@@ -10,22 +10,31 @@ Orchestrates the full distillation pipeline:
   4. Train the student with the combined distillation loss.
   5. Checkpoint and evaluate periodically.
 
-Supports CPU, CUDA, and Apple-Silicon MPS backends.
+Features:
+  * tqdm progress bar with live loss display
+  * Early stopping with configurable patience
+  * Mixed-precision training (AMP) on CUDA
+  * Full checkpoint resume (optimizer, scheduler, step state)
+  * CPU, CUDA, and Apple-Silicon MPS backends
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import os
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # graceful fallback
+    tqdm = None  # type: ignore[assignment]
 
 from ..config import DistillationConfig, NicheformerConfig, StudentConfig
 from ..models.teacher import NicheformerTeacher
@@ -50,12 +59,31 @@ def apply_mlm_masking(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply BERT-style masking to tokenised input.
 
+    Parameters
+    ----------
+    input_ids : (B, S)  int64 token tensor.
+    masking_p : probability of masking each eligible token.
+    n_tokens  : gene vocabulary size (excluding aux tokens).
+    aux_tokens: number of reserved special-token indices.
+    pad_token : index used for padding.
+    mask_token: index used for the [MASK] token.
+
     Returns
     -------
     masked_input : same shape, with masked positions replaced.
     labels       : ground-truth token ids; -100 at unmasked positions.
     mask_bool    : bool tensor, True at masked positions.
+
+    Raises
+    ------
+    ValueError
+        If ``input_ids`` is not a 2-D tensor.
     """
+    if input_ids.ndim != 2:
+        raise ValueError(
+            f"input_ids must be 2-D (batch, seq_len), got shape {input_ids.shape}"
+        )
+
     labels = input_ids.clone()
     masked_input = input_ids.clone()
 
@@ -104,10 +132,8 @@ def generate_synthetic_data(
     """
     tokens = torch.zeros(n_cells, seq_len, dtype=torch.long)
     for i in range(n_cells):
-        # Simulate: random number of expressed genes
         n_expressed = np.random.randint(50, min(seq_len, n_tokens))
         gene_indices = np.random.choice(n_tokens, n_expressed, replace=False)
-        # Random expression values -> sort by expression
         expr = np.random.exponential(1.0, size=n_expressed)
         order = np.argsort(-expr)
         sorted_genes = gene_indices[order][:seq_len]
@@ -144,8 +170,8 @@ class NicheformerDistiller:
         self.config = config
         self.tokenizer = tokenizer
 
-        # Device
-        self.device = torch.device(config.device)
+        # Device — validate availability
+        self.device = self._resolve_device(config.device)
         self.teacher = teacher.to(self.device).eval()
         self.student = student.to(self.device)
 
@@ -201,10 +227,30 @@ class NicheformerDistiller:
             self.optimizer, lr_lambda,
         )
 
+        # AMP scaler (CUDA only)
+        self.use_amp = config.use_amp and self.device.type == "cuda"
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
         # State
         self.global_step = 0
         self.best_loss = float("inf")
-        self.history: list = []
+        self.patience_counter = 0
+        self.history: List[Dict[str, Any]] = []
+
+    # --------------------------------------------------------- device helper
+
+    @staticmethod
+    def _resolve_device(device: str) -> torch.device:
+        """Validate and return a :class:`torch.device`, falling back to CPU."""
+        if device == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUDA requested but unavailable — falling back to CPU.")
+            return torch.device("cpu")
+        if device == "mps" and not (
+            hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        ):
+            logger.warning("MPS requested but unavailable — falling back to CPU.")
+            return torch.device("cpu")
+        return torch.device(device)
 
     # ---------------------------------------------------------------- train
 
@@ -237,9 +283,21 @@ class NicheformerDistiller:
         t0 = time.time()
 
         logger.info(
-            "Starting distillation: %d steps, lr=%.2e, device=%s",
-            max_steps, cfg.learning_rate, self.device,
+            "Starting distillation: %d steps, lr=%.2e, device=%s, amp=%s",
+            max_steps, cfg.learning_rate, self.device, self.use_amp,
         )
+
+        # Progress bar
+        pbar = None
+        if tqdm is not None:
+            pbar = tqdm(
+                total=max_steps,
+                initial=self.global_step,
+                desc="Distilling",
+                unit="step",
+            )
+
+        stopped_early = False
 
         while self.global_step < max_steps:
             for batch in dataloader:
@@ -253,14 +311,28 @@ class NicheformerDistiller:
                     accum_loss[k] = accum_loss.get(k, 0.0) + v
                 accum_n += 1
 
-                # Gradient accumulation
+                # Gradient accumulation + AMP
                 if (self.global_step + 1) % cfg.gradient_accumulation == 0:
+                    if self.use_amp:
+                        self.scaler.unscale_(self.optimizer)
                     nn.utils.clip_grad_norm_(
                         self.student.parameters(), cfg.max_grad_norm,
                     )
-                    self.optimizer.step()
+                    if self.use_amp:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
+
+                # Progress bar update
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        loss=f"{components.get('total_loss', 0):.4f}",
+                        mlm=f"{components.get('mlm_loss', 0):.4f}",
+                    )
 
                 # Logging
                 if (self.global_step + 1) % cfg.log_every == 0 and accum_n > 0:
@@ -286,11 +358,24 @@ class NicheformerDistiller:
                 if eval_dataloader and (self.global_step + 1) % cfg.eval_every == 0:
                     eval_loss = self._evaluate(eval_dataloader)
                     logger.info(
-                        "step %d | eval_loss %.4f", self.global_step + 1, eval_loss,
+                        "step %d | eval_loss %.4f",
+                        self.global_step + 1, eval_loss,
                     )
                     if eval_loss < self.best_loss:
                         self.best_loss = eval_loss
+                        self.patience_counter = 0
                         self.student.save(str(ckpt_dir / "best_student.pt"))
+                    else:
+                        self.patience_counter += 1
+
+                    # Early stopping
+                    if cfg.early_stopping and self.patience_counter >= cfg.patience:
+                        logger.info(
+                            "Early stopping at step %d (patience=%d exhausted).",
+                            self.global_step + 1, cfg.patience,
+                        )
+                        stopped_early = True
+                        break
 
                 # Checkpoint
                 if (self.global_step + 1) % cfg.save_every == 0:
@@ -299,6 +384,12 @@ class NicheformerDistiller:
                     )
 
                 self.global_step += 1
+
+            if stopped_early:
+                break
+
+        if pbar is not None:
+            pbar.close()
 
         # Final save
         self.student.save(str(ckpt_dir / "final_student.pt"))
@@ -330,7 +421,7 @@ class NicheformerDistiller:
         need_hidden = self.config.gamma > 0
         need_attn = self.config.delta > 0
 
-        # Teacher forward
+        # Teacher forward (always full precision)
         with torch.no_grad():
             teacher_out = self.teacher(
                 masked_teacher,
@@ -339,28 +430,31 @@ class NicheformerDistiller:
                 output_attentions=need_attn,
             )
 
-        # Student forward (same masked input if same tokenisation)
-        if self.tokenizer is not None and student_config.use_gene_modules:
-            # Gene-module students use a different tokenisation;
-            # distillation operates on the hidden-state level
-            student_input = masked_teacher  # simplification: share input
-        else:
-            student_input = masked_teacher
+        # Student forward (with optional AMP)
+        student_input = masked_teacher
 
-        student_out = self.student(
-            student_input,
-            padding_mask=padding_mask,
-            output_hidden_states=need_hidden,
-            output_attentions=need_attn,
+        autocast_ctx = (
+            torch.cuda.amp.autocast(enabled=True)
+            if self.use_amp
+            else _nullcontext()
         )
-
-        loss, components = self.criterion(
-            student_out, teacher_out, labels, masked_positions=mask_bool,
-        )
+        with autocast_ctx:
+            student_out = self.student(
+                student_input,
+                padding_mask=padding_mask,
+                output_hidden_states=need_hidden,
+                output_attentions=need_attn,
+            )
+            loss, components = self.criterion(
+                student_out, teacher_out, labels, masked_positions=mask_bool,
+            )
 
         # Scale for gradient accumulation
         scaled_loss = loss / self.config.gradient_accumulation
-        scaled_loss.backward()
+        if self.use_amp:
+            self.scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
 
         return loss, components
 
@@ -393,6 +487,50 @@ class NicheformerDistiller:
 
         self.student.train()
         return total_loss / max(n, 1)
+
+    # -------------------------------------------------- checkpoint resume
+
+    def save_checkpoint(self, path: str) -> None:
+        """Save full training state for resuming later.
+
+        Saves the student weights, optimizer, scheduler, scaler, and
+        step counters so that training can be resumed exactly where
+        it left off.
+        """
+        torch.save({
+            "global_step": self.global_step,
+            "best_loss": self.best_loss,
+            "patience_counter": self.patience_counter,
+            "student_state_dict": self.student.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict() if self.use_amp else None,
+            "criterion_state_dict": self.criterion.state_dict(),
+            "history": self.history,
+            "config": self.config,
+        }, path)
+        logger.info("Full checkpoint saved to %s (step %d)", path, self.global_step)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Resume training from a full checkpoint.
+
+        Parameters
+        ----------
+        path : str
+            Path to a checkpoint saved by :meth:`save_checkpoint`.
+        """
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.student.load_state_dict(ckpt["student_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if self.use_amp and ckpt.get("scaler_state_dict") is not None:
+            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+        self.criterion.load_state_dict(ckpt["criterion_state_dict"])
+        self.global_step = ckpt["global_step"]
+        self.best_loss = ckpt["best_loss"]
+        self.patience_counter = ckpt.get("patience_counter", 0)
+        self.history = ckpt.get("history", [])
+        logger.info("Resumed from %s at step %d", path, self.global_step)
 
     # -------------------------------------------------- convenience builders
 
@@ -430,3 +568,15 @@ class NicheformerDistiller:
         """Wrap a token tensor in a DataLoader."""
         ds = TensorDataset(tokens)
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=True)
+
+
+# ---------------------------------------------------------------------------
+# Tiny helper for optional context managers
+# ---------------------------------------------------------------------------
+
+class _nullcontext:
+    """Minimal no-op context manager (for Python 3.9 compat)."""
+    def __enter__(self) -> None:
+        return None
+    def __exit__(self, *args: object) -> None:
+        pass

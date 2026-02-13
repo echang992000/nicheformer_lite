@@ -123,10 +123,36 @@ class GeneModuleTokenizer:
             Raw or normalised expression counts.
         gene_names : sequence of str, optional
             Gene identifiers (for interpretability).
+
+        Raises
+        ------
+        ValueError
+            If the input has fewer than 2 dimensions, contains NaN/Inf,
+            or has fewer genes than modules.
         """
+        if hasattr(expression_matrix, "ndim"):
+            if expression_matrix.ndim != 2:
+                raise ValueError(
+                    f"expression_matrix must be 2-D (cells, genes), "
+                    f"got shape {expression_matrix.shape}"
+                )
+        X_check = _to_dense(expression_matrix)
+        if not np.all(np.isfinite(X_check[:min(1000, len(X_check))])):
+            raise ValueError("expression_matrix contains NaN or Inf values")
+        if X_check.shape[1] < self.n_modules:
+            raise ValueError(
+                f"Number of genes ({X_check.shape[1]}) must be >= n_modules "
+                f"({self.n_modules})"
+            )
+
         self.n_genes = expression_matrix.shape[1]
         if gene_names is not None:
             self.gene_names = np.asarray(gene_names)
+            if len(self.gene_names) != self.n_genes:
+                raise ValueError(
+                    f"gene_names length ({len(self.gene_names)}) != "
+                    f"n_genes ({self.n_genes})"
+                )
 
         rng = np.random.RandomState(self.random_state)
         X_sub = _subsample_rows(expression_matrix, self.max_fit_cells, rng)
